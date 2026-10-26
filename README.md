@@ -1,2 +1,2 @@
 # Active-learning-for-material-discovery
-Active learning framework for exploring host–dopant–concentration combinations to identify the optimal host–dopant system for investigating the relationship between charge-transfer exciton dynamics and photofunctional material performance. 
+Active learning framework for exploring host–dopant–concentration combinations to identify the optimal host–dopant system for investigating the relationship between charge-transfer exciton dynamics and photofunctional material performance. The material discovery process is divided into two steps. Step 1: discovery of the host material. Step 2: optimization of the host–dopant–concentration combinations. All code is executed in Jupyter notebooks.
