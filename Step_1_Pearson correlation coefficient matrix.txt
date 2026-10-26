@@ -1,0 +1,50 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib import rcParams
+
+rcParams['font.sans-serif'] = ['Arial']
+plt.rcParams['axes.unicode_minus'] = False
+
+file_path = r"E:\Users\clz\Desktop\ML-data\ML-Kmeans-1.xlsx"
+df = pd.read_excel(file_path)
+
+descriptor_columns = df.columns[0:]  
+descriptor_data = df[descriptor_columns]
+
+correlation_matrix = descriptor_data.corr(method='pearson')
+
+colors_alt = [(0.2, 0.4, 0.6),    
+              (1, 1, 1),         
+              (0.9, 0.5, 0.3)]    
+
+n_bins = 100
+custom_cmap_alt = LinearSegmentedColormap.from_list('custom_alt', colors_alt, N=n_bins)
+
+plt.figure(figsize=(14, 12))
+
+heatmap = sns.heatmap(correlation_matrix, 
+                      annot=True, 
+                      fmt=".2f", 
+                      cmap=custom_cmap_alt,
+                      center=0,
+                      square=True,
+                      cbar_kws={"shrink": .8},
+                      linewidths=0.5,
+                      linecolor='white',
+                      annot_kws={"size": 16})
+
+plt.xticks(rotation=0, ha='right', fontsize=20)
+plt.yticks(rotation=0, fontsize=20)
+
+cbar = heatmap.collections[0].colorbar
+cbar.ax.tick_params(labelsize=20)
+
+plt.tight_layout()
+
+plt.show()
+
+plt.savefig(r"E:\Users\clz\Desktop\correlation_matrix.eps", format='eps', dpi=600, bbox_inches='tight', 
+            facecolor='white', edgecolor='none')

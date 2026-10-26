@@ -1,0 +1,259 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from umap import UMAP
+import warnings
+warnings.filterwarnings('ignore')
+
+plt.rcParams['font.sans-serif'] = ['Arial']
+plt.rcParams['axes.unicode_minus'] = False
+
+
+def load_and_sample_data():
+    """Load data for random sampling experiment."""
+    filepath = r"E:\Users\clz\Desktop\ML-data\chemical-space-H-G.xlsx"
+    df = pd.read_excel(filepath)
+
+    print("=" * 60)
+    print("Data loaded successfully")
+    print("=" * 60)
+    print(f"Data shape: {df.shape}")
+    print("\nFirst 5 rows:")
+    print(df.head())
+    print("\nColumn names:")
+    print(df.columns.tolist())
+    print("\nData info:")
+    print(df.info())
+
+    print("\nSummary statistics for numeric columns:")
+    numeric_cols = ['C_GUEST', 'E1', 'E2']
+    print(df[numeric_cols].describe())
+
+    return df
+
+
+def random_sampling_experiment(df, n_rounds=3, samples_per_round=6):
+    """Run the random sampling experiment."""
+    total_samples = len(df)
+    all_indices = set(range(total_samples))
+    sampled_indices = set()
+
+    print("\n" + "=" * 60)
+    print("Starting random sampling experiment")
+    print("=" * 60)
+    print(f"Total samples: {total_samples}")
+    print(f"Sampling rounds: {n_rounds}")
+    print(f"Samples per round: {samples_per_round}")
+    print(f"Total samples to select: {n_rounds * samples_per_round}")
+
+    sampling_results = {}
+
+    for round_num in range(1, n_rounds + 1):
+        print(f"\n--- Round {round_num} sampling ---")
+
+        available_indices = list(all_indices - sampled_indices)
+
+        if len(available_indices) < samples_per_round:
+            print(f"Warning: insufficient samples available. "
+                  f"Required {samples_per_round}, only {len(available_indices)} available")
+            break
+
+        round_indices = np.random.choice(available_indices, samples_per_round, replace=False)
+        sampled_indices.update(round_indices)
+
+        sampling_results[round_num] = {
+            'indices': round_indices,
+            'data': df.iloc[round_indices].copy()
+        }
+
+        print(f"Selected indices: {sorted(round_indices)}")
+        print("\nSelected data:")
+        round_data = df.iloc[round_indices]
+        print(round_data[['HOST_SMILES', 'GUEST_SMILES', 'C_GUEST', 'E1', 'E2']].to_string(index=False))
+
+        print(f"\nRound {round_num} statistics:")
+        print(f"  C_GUEST: mean={round_data['C_GUEST'].mean():.3f}, "
+              f"range=[{round_data['C_GUEST'].min():.3f}, {round_data['C_GUEST'].max():.3f}]")
+        print(f"  E1: mean={round_data['E1'].mean():.3f}, "
+              f"range=[{round_data['E1'].min():.3f}, {round_data['E1'].max():.3f}]")
+        print(f"  E2: mean={round_data['E2'].mean():.3f}, "
+              f"range=[{round_data['E2'].min():.3f}, {round_data['E2'].max():.3f}]")
+
+    return sampling_results
+
+
+def visualize_sampling_results(df, sampling_results):
+    """Visualize the sampling results."""
+
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    fig.suptitle('Visualization of Random Sampling Results', fontsize=16, fontweight='bold')
+
+    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1']
+
+    all_sampled_indices = []
+    for round_num, result in sampling_results.items():
+        indices = result['indices']
+        all_sampled_indices.extend(indices)
+        axes[0, 0].scatter(indices, [round_num] * len(indices),
+                           color=colors[round_num - 1], s=50, label=f'Round {round_num}')
+
+    axes[0, 0].set_xlabel('Sample Index')
+    axes[0, 0].set_ylabel('Sampling Round')
+    axes[0, 0].set_title('Distribution of Selected Samples')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+
+    features = ['C_GUEST', 'E1', 'E2']
+    feature_names = ['Concentration (C_GUEST)', 'Energy Level E1', 'Energy Level E2']
+
+    for i, feature in enumerate(features):
+        axes[0, 1].hist(df[feature], bins=20, alpha=0.3, color='gray',
+                        label='Full dataset' if i == 0 else "")
+
+        sampled_data = []
+        for round_num, result in sampling_results.items():
+            round_feature = result['data'][feature].values
+            sampled_data.extend(round_feature)
+
+        axes[0, 1].hist(sampled_data, bins=15, alpha=0.7, color=colors[i],
+                        label=feature_names[i])
+
+    axes[0, 1].set_xlabel('Feature Value')
+    axes[0, 1].set_ylabel('Frequency')
+    axes[0, 1].set_title('Feature Distribution Comparison')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+
+    feature_matrix = df[['C_GUEST', 'E1', 'E2']].values
+
+    umap = UMAP(n_components=2, random_state=42, n_neighbors=15, min_dist=0.8)
+    embedding_2d = umap.fit_transform(feature_matrix)
+
+    axes[1, 0].scatter(embedding_2d[:, 0], embedding_2d[:, 1],
+                       alpha=0.2, c='lightgray', s=10, label='Unsampled')
+
+    for round_num, result in sampling_results.items():
+        round_indices = result['indices']
+        round_points = embedding_2d[round_indices]
+        axes[1, 0].scatter(round_points[:, 0], round_points[:, 1],
+                           color=colors[round_num - 1], s=30,
+                           label=f'Round {round_num}', alpha=0.8)
+
+        for j, idx in enumerate(round_indices):
+            axes[1, 0].annotate(f'R{round_num}',
+                                (round_points[j, 0], round_points[j, 1]),
+                                xytext=(5, 5), textcoords='offset points',
+                                fontsize=8, alpha=0.7)
+
+    axes[1, 0].set_xlabel('UMAP Dimension 1')
+    axes[1, 0].set_ylabel('UMAP Dimension 2')
+    axes[1, 0].set_title('Sampling Distribution in Chemical Space (UMAP)')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+
+    total_samples = len(df)
+    sampled_counts = np.zeros(total_samples)
+
+    for round_num, result in sampling_results.items():
+        sampled_counts[result['indices']] += 1
+
+    coverage_percentage = (sampled_counts > 0).sum() / total_samples * 100
+
+    unique, counts = np.unique(sampled_counts, return_counts=True)
+    axes[1, 1].bar(unique, counts, color=colors[:len(unique)], alpha=0.7)
+    axes[1, 1].set_xlabel('Number of Times Sampled')
+    axes[1, 1].set_ylabel('Number of Samples')
+    axes[1, 1].set_title(f'Sampling Frequency Distribution (Coverage: {coverage_percentage:.1f}%)')
+
+    for i, count in enumerate(counts):
+        axes[1, 1].text(unique[i], count, str(count),
+                        ha='center', va='bottom', fontweight='bold')
+
+    axes[1, 1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+    return embedding_2d
+
+
+def generate_sampling_report(df, sampling_results, embedding_2d):
+    """Generate a detailed sampling report."""
+
+    print("\n" + "=" * 60)
+    print("Detailed Report of Random Sampling Experiment")
+    print("=" * 60)
+
+    total_samples = len(df)
+    all_sampled_indices = []
+
+    for round_num, result in sampling_results.items():
+        all_sampled_indices.extend(result['indices'])
+
+    sampled_count = len(set(all_sampled_indices))
+    coverage = sampled_count / total_samples * 100
+
+    print(f"Overall statistics:")
+    print(f"  Total samples: {total_samples}")
+    print(f"  Sampled samples: {sampled_count}")
+    print(f"  Sampling coverage: {coverage:.2f}%")
+    print(f"  Duplicate selections: {len(all_sampled_indices) - sampled_count}")
+
+    print(f"\nPer-round statistics:")
+    for round_num, result in sampling_results.items():
+        round_data = result['data']
+        print(f"  Round {round_num}: {len(result['indices'])} samples")
+        print(f"    Concentration range: [{round_data['C_GUEST'].min():.3f}, {round_data['C_GUEST'].max():.3f}]")
+        print(f"    E1 range: [{round_data['E1'].min():.3f}, {round_data['E1'].max():.3f}]")
+        print(f"    E2 range: [{round_data['E2'].min():.3f}, {round_data['E2'].max():.3f}]")
+
+    print(f"\nFeature space coverage analysis:")
+    all_data_ranges = {
+        'C_GUEST': (df['C_GUEST'].min(), df['C_GUEST'].max()),
+        'E1': (df['E1'].min(), df['E1'].max()),
+        'E2': (df['E2'].min(), df['E2'].max())
+    }
+
+    sampled_df = df.iloc[list(set(all_sampled_indices))]
+
+    for feature, (min_val, max_val) in all_data_ranges.items():
+        sampled_min = sampled_df[feature].min()
+        sampled_max = sampled_df[feature].max()
+        range_coverage = (sampled_max - sampled_min) / (max_val - min_val) * 100
+        print(f"  {feature}: {range_coverage:.1f}% of the value range covered")
+
+    output_data = []
+    for round_num, result in sampling_results.items():
+        for idx in result['indices']:
+            row = df.iloc[idx].copy()
+            row['Sampling_Round'] = round_num
+            row['UMAP_1'] = embedding_2d[idx, 0]
+            row['UMAP_2'] = embedding_2d[idx, 1]
+            output_data.append(row)
+
+    output_df = pd.DataFrame(output_data)
+    output_file = r"E:\Users\clz\Desktop\ML-data\sampling_results.xlsx"
+    output_df.to_excel(output_file, index=False)
+    print(f"\nSampling results saved to: {output_file}")
+
+
+def main():
+    """Main function."""
+    np.random.seed(42)
+
+    df = load_and_sample_data()
+
+    sampling_results = random_sampling_experiment(df, n_rounds=3, samples_per_round=6)
+
+    embedding_2d = visualize_sampling_results(df, sampling_results)
+
+    generate_sampling_report(df, sampling_results, embedding_2d)
+
+    print("\n" + "=" * 60)
+    print("Random sampling experiment completed")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,280 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.gaussian_process import GaussianProcessClassifier
+from sklearn.gaussian_process.kernels import Matern, ConstantKernel as C
+from scipy.stats import entropy
+from sklearn.model_selection import cross_val_score
+import umap
+
+
+file_path = r'E:\Users\clz\Desktop\ML-data\ML-Kmeans-1.xlsx'
+df = pd.read_excel(file_path)
+
+descriptors_data = df
+
+descriptors_filled = descriptors_data.fillna(descriptors_data.mean())
+
+scaler = StandardScaler()
+descriptors_scaled = scaler.fit_transform(descriptors_filled)
+
+molecule_ids = [f"Mol_{i+1}" for i in range(descriptors_scaled.shape[0])]
+
+
+def active_learning_classification(descriptors, molecule_ids, tested_indices, tested_results,
+                                   n_recommendations=6, kappa=1):
+  
+    X_train = descriptors[tested_indices]
+    y_train = np.array([1 if result > 0 else 0 for result in tested_results])
+
+    kernel = C(1.0, (0.1, 10.0)) * Matern(
+        length_scale=1.0,
+        length_scale_bounds=(0.1, 10.0),
+        nu=1.0
+    )
+
+    gpc = GaussianProcessClassifier(
+        kernel=kernel,
+        n_restarts_optimizer=10,
+        random_state=42,
+        max_iter_predict=100
+    )
+
+    gpc.fit(X_train, y_train)
+
+    untested_indices = [i for i in range(len(descriptors)) if i not in tested_indices]
+    X_untested = descriptors[untested_indices]
+
+    y_prob = gpc.predict_proba(X_untested)
+    positive_proba = y_prob[:, 1]
+    uncertainty = np.array([entropy(proba) for proba in y_prob])
+
+    std_dev = np.sqrt(positive_proba * (1 - positive_proba))
+
+    acquisition_scores = positive_proba + kappa * std_dev
+
+    top_indices = np.argsort(acquisition_scores)[-n_recommendations:][::-1]
+    recommended_indices = [untested_indices[i] for i in top_indices]
+
+    if len(X_train) >= 3:
+        cv_scores = cross_val_score(gpc, X_train, y_train, cv=min(3, len(X_train)), scoring='accuracy')
+        cv_mean = np.mean(cv_scores)
+        cv_std = np.std(cv_scores)
+    else:
+        cv_mean = gpc.score(X_train, y_train)
+        cv_std = 0.0
+
+    return recommended_indices, gpc, acquisition_scores
+
+
+def adaptive_kappa_strategy(round_num, total_rounds, base_kappa=1.0, exploration_focus=True):
+    """
+    Adaptive kappa adjustment strategy.
+    """
+    progress = round_num / total_rounds
+
+    if exploration_focus:
+        adaptive_kappa = base_kappa * (2.2 - 1.4 * progress)
+    else:
+        adaptive_kappa = base_kappa * (1.4 - 0.8 * progress)
+
+    return max(adaptive_kappa, base_kappa * 0.5)
+
+
+def plot_acquisition_scores(descriptors, tested_indices, recommended_indices,
+                            acquisition_scores, molecule_ids, round_num, kappa):
+    """
+    Visualize acquisition function scores.
+    """
+    reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=min(15, len(descriptors)-1),
+                        min_dist=0.1, metric='euclidean')
+    embedding = reducer.fit_transform(descriptors)
+
+    plt.figure(figsize=(12, 9))
+
+    untested_indices = [i for i in range(len(descriptors)) if i not in tested_indices]
+
+    if len(untested_indices) > 0:
+        scatter = plt.scatter(embedding[untested_indices, 0], embedding[untested_indices, 1],
+                              c=acquisition_scores, cmap='viridis', s=60, alpha=0.8,
+                              edgecolors='white', linewidth=0.5)
+        plt.colorbar(scatter, label='Acquisition Score')
+
+    inactive_indices = [tested_indices[i] for i, result in enumerate(tested_results) if result == 0]
+    if inactive_indices:
+        plt.scatter(embedding[inactive_indices, 0], embedding[inactive_indices, 1],
+                    c='blue', s=100, marker='o', label='Tested (Inactive)',
+                    edgecolors='white', linewidth=1.5, alpha=0.8)
+
+    active_indices = [tested_indices[i] for i, result in enumerate(tested_results) if result > 0]
+    if active_indices:
+        plt.scatter(embedding[active_indices, 0], embedding[active_indices, 1],
+                    c='red', s=200, marker='*', label='Tested (Active)',
+                    edgecolors='gold', linewidth=2, alpha=1.0)
+
+    if recommended_indices:
+        plt.scatter(embedding[recommended_indices, 0], embedding[recommended_indices, 1],
+                    c='orange', s=150, marker='s', edgecolors='black', linewidth=2,
+                    label='Recommended', alpha=1.0)
+
+        for idx in recommended_indices:
+            if idx in untested_indices:
+                pos_in_untested = untested_indices.index(idx)
+                score = acquisition_scores[pos_in_untested]
+                plt.annotate(f'{idx}\n({score:.3f})',
+                             (embedding[idx, 0], embedding[idx, 1]),
+                             xytext=(8, 8),
+                             textcoords='offset points',
+                             fontsize=9,
+                             fontweight='bold',
+                             bbox=dict(boxstyle="round,pad=0.3", facecolor="yellow", alpha=0.8))
+
+    plt.title(f'Round {round_num}: UCB Acquisition Scores with Matern Kernel (kappa={kappa})\n'
+              f'Formula: mu + {kappa} x sigma', fontsize=14)
+    plt.legend(fontsize=12)
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+
+def visualize_chemical_space(descriptors, tested_indices, tested_results, molecule_ids,
+                             current_recommendations=None, title_suffix=""):
+    """
+    Visualize chemical space, highlighting tested and recommended molecules.
+    """
+    reducer = umap.UMAP(n_components=2, random_state=42,
+                        n_neighbors=min(15, len(descriptors)-1),
+                        min_dist=0.1, metric='euclidean')
+    embedding = reducer.fit_transform(descriptors)
+
+    plt.figure(figsize=(10, 8))
+
+    plt.scatter(embedding[:, 0], embedding[:, 1],
+                c='lightgray', s=40, alpha=0.6, label='Untested')
+
+    inactive_indices = [tested_indices[i] for i, result in enumerate(tested_results) if result == 0]
+    if inactive_indices:
+        plt.scatter(embedding[inactive_indices, 0], embedding[inactive_indices, 1],
+                    c='blue', s=100, alpha=0.8, label='Tested (Inactive)',
+                    edgecolors='white', linewidth=1.5)
+
+    active_indices = [tested_indices[i] for i, result in enumerate(tested_results) if result > 0]
+    if active_indices:
+        plt.scatter(embedding[active_indices, 0], embedding[active_indices, 1],
+                    c='red', s=200, marker='*', label='Tested (Active)',
+                    edgecolors='gold', linewidth=2)
+
+    if current_recommendations:
+        plt.scatter(embedding[current_recommendations, 0], embedding[current_recommendations, 1],
+                    c='orange', s=150, marker='s', edgecolors='black', linewidth=2,
+                    label='Recommended')
+
+    labels_to_show = active_indices + (current_recommendations if current_recommendations else [])
+    for idx in labels_to_show:
+        plt.annotate(str(idx),
+                     (embedding[idx, 0], embedding[idx, 1]),
+                     xytext=(5, 5),
+                     textcoords='offset points',
+                     fontsize=10,
+                     fontweight='bold',
+                     bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.7))
+
+    plt.title(f'Chemical Space Visualization {title_suffix}\n'
+              f'(Matern Kernel Gaussian Process)', fontsize=14)
+    plt.legend(loc='upper left', frameon=True, fontsize=12, framealpha=0.9)
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+
+def get_experimental_results(recommended_indices, molecule_ids):
+    """
+    Obtain experimental test results.
+    """
+    results = []
+    for idx in recommended_indices:
+        while True:
+            try:
+                result = input(f"Molecule {idx} ({molecule_ids[idx]}) active? (0=inactive, 1=active): ")
+                result = int(result)
+                if result in [0, 1]:
+                    results.append(result)
+                    break
+            except ValueError:
+                pass
+    return results
+
+
+def explain_matern_kernel():
+    pass
+
+
+def explain_ucb_strategy():
+    pass
+
+if __name__ == "__main__":
+    tested_indices = [76, 10, 4, 99, 70, 66]
+    tested_results = [0, 0, 0, 0, 0, 1]
+
+    explain_matern_kernel()
+    explain_ucb_strategy()
+
+    visualize_chemical_space(
+        descriptors_scaled,
+        tested_indices,
+        tested_results,
+        molecule_ids,
+        title_suffix="- Initial State"
+    )
+
+    round_num = 1
+    continue_learning = True
+    total_rounds = 4
+    base_kappa = 1.0
+    exploration_focus = True
+
+    while continue_learning and len(tested_indices) < len(descriptors_scaled):
+        current_kappa = adaptive_kappa_strategy(round_num, total_rounds, base_kappa, exploration_focus)
+
+        recommended_indices, model, acquisition_scores = active_learning_classification(
+            descriptors_scaled,
+            molecule_ids,
+            tested_indices,
+            tested_results,
+            n_recommendations=min(6, len(descriptors_scaled) - len(tested_indices)),
+            kappa=current_kappa
+        )
+
+        plot_acquisition_scores(
+            descriptors_scaled,
+            tested_indices,
+            recommended_indices,
+            acquisition_scores,
+            molecule_ids,
+            round_num,
+            current_kappa
+        )
+
+        new_results = get_experimental_results(recommended_indices, molecule_ids)
+
+        tested_indices.extend(recommended_indices)
+        tested_results.extend(new_results)
+
+        if len(tested_indices) < len(descriptors_scaled):
+            while True:
+                response = input("Continue next round of active learning? (y/n): ").lower()
+                if response in ['y', 'n']:
+                    continue_learning = (response == 'y')
+                    break
+        else:
+            continue_learning = False
+
+        round_num += 1
+
+    visualize_chemical_space(
+        descriptors_scaled,
+        tested_indices,
+        tested_results,
+        molecule_ids,
+    )

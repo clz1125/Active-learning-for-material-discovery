@@ -1,0 +1,691 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from umap import UMAP
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from scipy.optimize import minimize
+import os
+import pickle
+
+
+class HostGuestBayesianOptimizer:
+    def __init__(self):
+        self.X_initial = None
+        self.y_initial = None
+        self.X_all = None
+        self.descriptors_all = None
+        self.gp = None
+        self.chemical_space_2d = None
+        self.iteration = 0
+        self.tested_indices = []
+        self.df = None
+        self.distance_matrix = None
+
+        self.combination_data = {}
+        self.thetas = np.array([1.0, 1.0, 1.0, 1.0, 1.0])
+        self.theta_bounds = [(0.2, 3.0), (0.2, 3.0), (1, 3.0), (1, 3.0), (0.2, 3.0)]
+
+        self.feature_stats = {
+            'conc_mean': 0.0, 'conc_std': 1.0,
+            'e1_mean': 0.0, 'e1_std': 1.0,
+            'e2_mean': 0.0, 'e2_std': 1.0
+        }
+
+    def smiles_to_fingerprint(self, smiles, radius=2, n_bits=1024):
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                return np.zeros(n_bits)
+            fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+            return np.array(fp)
+        except Exception:
+            return np.zeros(n_bits)
+
+    def tanimoto_distance(self, fp1, fp2):
+        if np.sum(fp1) == 0 and np.sum(fp2) == 0:
+            return 0.0
+        intersection = np.sum(fp1 & fp2)
+        union = np.sum(fp1 | fp2)
+        if union == 0:
+            return 1.0
+        return 1.0 - (intersection / union)
+
+    def compute_feature_statistics(self, X_data):
+        conc_values, e1_values, e2_values = [], [], []
+        for features in X_data:
+            _, _, conc, e1, e2 = features
+            conc_values.append(float(conc))
+            e1_values.append(float(e1))
+            e2_values.append(float(e2))
+        self.feature_stats = {
+            'conc_mean': np.mean(conc_values),
+            'conc_std': max(np.std(conc_values), 1e-6),
+            'e1_mean': np.mean(e1_values),
+            'e1_std': max(np.std(e1_values), 1e-6),
+            'e2_mean': np.mean(e2_values),
+            'e2_std': max(np.std(e2_values), 1e-6)
+        }
+
+    def compute_comprehensive_distance_matrix(self, df):
+        n_samples = len(df)
+        host_fps = [self.smiles_to_fingerprint(s) for s in df['HOST_SMILES']]
+        guest_fps = [self.smiles_to_fingerprint(s) for s in df['GUEST_SMILES']]
+        conc_values = df['C_GUEST'].astype(float).values
+        e1_values = df['E1'].astype(float).values
+        e2_values = df['E2'].astype(float).values
+
+        distance_matrix = np.zeros((n_samples, n_samples))
+        for i in range(n_samples):
+            for j in range(i, n_samples):
+                de1_sq = (e1_values[i] - e1_values[j]) ** 2
+                de2_sq = (e2_values[i] - e2_values[j]) ** 2
+                d_host_sq = self.tanimoto_distance(host_fps[i], host_fps[j]) ** 2
+                d_guest_sq = self.tanimoto_distance(guest_fps[i], guest_fps[j]) ** 2
+                d_conc_sq = (conc_values[i] - conc_values[j]) ** 2
+                de1_norm = de1_sq / (self.feature_stats['e1_std'] ** 2)
+                de2_norm = de2_sq / (self.feature_stats['e2_std'] ** 2)
+                d_conc_norm = d_conc_sq / (self.feature_stats['conc_std'] ** 2)
+                total_distance = de1_norm + de2_norm + d_host_sq + d_guest_sq + d_conc_norm
+                distance_matrix[i, j] = total_distance
+                distance_matrix[j, i] = total_distance
+        self.distance_matrix = distance_matrix
+        return distance_matrix
+
+    def normalize_distance_components(self, de1_sq, de2_sq, d_host_sq, d_guest_sq, d_conc_sq):
+        de1_norm = de1_sq / (self.feature_stats['e1_std'] ** 2) if self.feature_stats['e1_std'] > 0 else de1_sq
+        de2_norm = de2_sq / (self.feature_stats['e2_std'] ** 2) if self.feature_stats['e2_std'] > 0 else de2_sq
+        d_conc_norm = d_conc_sq / (self.feature_stats['conc_std'] ** 2) if self.feature_stats['conc_std'] > 0 else d_conc_sq
+        return de1_norm, de2_norm, d_host_sq, d_guest_sq, d_conc_norm
+
+    def custom_kernel(self, X1, X2, thetas=None):
+        if thetas is None:
+            thetas = self.thetas
+        n1, n2 = len(X1), len(X2)
+        kernel_matrix = np.zeros((n1, n2))
+        theta1, theta2, theta3, theta4, theta5 = thetas
+        for i in range(n1):
+            for j in range(n2):
+                host_fp1, guest_fp1, conc1, e1_1, e2_1 = X1[i]
+                host_fp2, guest_fp2, conc2, e1_2, e2_2 = X2[j]
+                conc1, conc2 = float(conc1), float(conc2)
+                e1_1, e1_2 = float(e1_1), float(e1_2)
+                e2_1, e2_2 = float(e2_1), float(e2_2)
+                de1_sq = (e1_1 - e1_2) ** 2
+                de2_sq = (e2_1 - e2_2) ** 2
+                d_host_sq = self.tanimoto_distance(host_fp1, host_fp2) ** 2
+                d_guest_sq = self.tanimoto_distance(guest_fp1, guest_fp2) ** 2
+                d_conc_sq = (conc1 - conc2) ** 2
+                de1_norm, de2_norm, d_host_norm, d_guest_norm, d_conc_norm = self.normalize_distance_components(
+                    de1_sq, de2_sq, d_host_sq, d_guest_sq, d_conc_sq)
+                total_distance = (de1_norm / theta1**2 + de2_norm / theta2**2 +
+                                  d_host_norm / theta3**2 + d_guest_norm / theta4**2 +
+                                  d_conc_norm / theta5**2)
+                kernel_matrix[i, j] = np.exp(-total_distance)
+        return kernel_matrix
+
+    def negative_log_likelihood(self, thetas):
+        try:
+            X_train, y_train = self.X_initial, self.y_initial
+            K = self.custom_kernel(X_train, X_train, thetas)
+            K += np.eye(len(X_train)) * 1e-6
+            L = np.linalg.cholesky(K)
+            alpha = np.linalg.solve(L.T, np.linalg.solve(L, y_train))
+            log_likelihood = (-0.5 * y_train.dot(alpha)
+                              - np.sum(np.log(np.diag(L)))
+                              - 0.5 * len(y_train) * np.log(2 * np.pi))
+            return -log_likelihood
+        except Exception:
+            return 1e10
+
+    def negative_log_likelihood_with_penalty(self, thetas):
+        try:
+            nll = self.negative_log_likelihood(thetas)
+            penalty = 0.0
+            min_theta = np.min(thetas[:4])
+            if min_theta < 0.5:
+                penalty += 10.0 * (0.5 - min_theta) ** 2
+            theta_range = np.max(thetas[:4]) - np.min(thetas[:4])
+            if theta_range < 0.5:
+                penalty += 5.0 * (0.5 - theta_range) ** 2
+            theta_ratio = thetas[4] / np.mean(thetas[:4])
+            if theta_ratio > 3.0:
+                penalty += 5.0 * (theta_ratio - 3.0) ** 2
+            return nll + penalty
+        except Exception:
+            return 1e10
+
+    def optimize_hyperparameters_multistart(self, n_restarts=3):
+        if len(self.X_initial) < 3:
+            return self.thetas
+        best_thetas = self.thetas.copy()
+        best_nll = np.inf
+        for restart in range(n_restarts):
+            if restart == 0:
+                initial_guess = self.thetas.copy()
+            else:
+                initial_guess = np.random.uniform(
+                    low=[0.2, 0.2, 0.2, 0.2, 0.2],
+                    high=[2.0, 2.0, 2.0, 2.0, 3.0], size=5)
+            result = minimize(self.negative_log_likelihood_with_penalty, initial_guess,
+                              method='L-BFGS-B', bounds=self.theta_bounds,
+                              options={'maxiter': 100, 'disp': False})
+            if result.success and result.fun < best_nll:
+                best_nll = result.fun
+                best_thetas = result.x
+        return best_thetas
+
+    def optimize_hyperparameters(self):
+        return self.optimize_hyperparameters_multistart(n_restarts=3)
+
+    def load_data(self, filepath):
+        self.df = pd.read_excel(filepath)
+        df = self.df
+        df['host_fp'] = df['HOST_SMILES'].apply(self.smiles_to_fingerprint)
+        df['guest_fp'] = df['GUEST_SMILES'].apply(self.smiles_to_fingerprint)
+        self.X_all = []
+        self.descriptors_all = []
+        for _, row in df.iterrows():
+            features = (row['host_fp'], row['guest_fp'],
+                        float(row['C_GUEST']), float(row['E1']), float(row['E2']))
+            self.X_all.append(features)
+            self.descriptors_all.append([float(row['C_GUEST']), float(row['E1']), float(row['E2'])])
+        self.descriptors_all = np.array(self.descriptors_all)
+        self.compute_feature_statistics(self.X_all)
+        self.compute_comprehensive_distance_matrix(df)
+        return df
+
+    def _update_combination_data(self, idx, activity):
+        host = self.df.iloc[idx]['HOST_SMILES']
+        guest = self.df.iloc[idx]['GUEST_SMILES']
+        conc = float(self.df.iloc[idx]['C_GUEST'])
+        key = (host, guest)
+        if key not in self.combination_data:
+            self.combination_data[key] = {'concentrations': [], 'activities': []}
+        self.combination_data[key]['concentrations'].append(conc)
+        self.combination_data[key]['activities'].append(activity)
+        sorted_idx = np.argsort(self.combination_data[key]['concentrations'])
+        self.combination_data[key]['concentrations'] = [
+            self.combination_data[key]['concentrations'][i] for i in sorted_idx]
+        self.combination_data[key]['activities'] = [
+            self.combination_data[key]['activities'][i] for i in sorted_idx]
+
+    def _is_combination_explored(self, host, guest):
+        key = (host, guest)
+        if key not in self.combination_data:
+            return False
+        data = self.combination_data[key]
+        if len(data['concentrations']) < 3:
+            return False
+        acts = data['activities']
+        max_idx = np.argmax(acts)
+        if max_idx == 0 or max_idx == len(acts) - 1:
+            return False
+        left_increasing = all(acts[i] < acts[i + 1] for i in range(max_idx))
+        right_decreasing = all(acts[i] > acts[i + 1] for i in range(max_idx, len(acts) - 1))
+        return left_increasing and right_decreasing
+
+    def initialize_with_samples(self, sample_indices, activities):
+        self.X_initial = [self.X_all[i] for i in sample_indices]
+        self.y_initial = np.array(activities, dtype=float)
+        self.tested_indices = sample_indices.copy()
+        for idx, act in zip(sample_indices, activities):
+            self._update_combination_data(idx, act)
+        self.thetas = self.optimize_hyperparameters()
+        self._train_gp_model()
+        self._compute_chemical_space()
+
+    def _train_gp_model(self):
+        try:
+            X_train, y_train = self.X_initial, self.y_initial
+            if len(X_train) < 2:
+                self.gp = None
+                return
+            K = self.custom_kernel(X_train, X_train, self.thetas)
+            K += np.eye(len(X_train)) * 1e-6
+            self.gp = {
+                'X_train': X_train,
+                'y_train': y_train,
+                'K': K,
+                'L': np.linalg.cholesky(K),
+                'alpha': np.linalg.solve(K, y_train),
+                'thetas': self.thetas.copy(),
+                'is_trained': True
+            }
+        except Exception:
+            self.gp = None
+
+    def _compute_chemical_space(self):
+        try:
+            if self.distance_matrix is not None and len(self.distance_matrix) > 1:
+                n_neighbors = min(15, len(self.distance_matrix) - 1)
+                umap = UMAP(n_components=2, random_state=42, n_neighbors=n_neighbors,
+                            min_dist=1.0, metric='precomputed')
+                self.chemical_space_2d = umap.fit_transform(self.distance_matrix)
+            elif len(self.descriptors_all) > 1:
+                n_neighbors = min(15, len(self.descriptors_all) - 1)
+                umap = UMAP(n_components=2, random_state=42,
+                            n_neighbors=n_neighbors, min_dist=0.8)
+                self.chemical_space_2d = umap.fit_transform(self.descriptors_all)
+            else:
+                self.chemical_space_2d = np.zeros((len(self.descriptors_all), 2))
+        except Exception:
+            self.chemical_space_2d = np.random.rand(len(self.descriptors_all), 2)
+
+    def predict(self, X):
+        if self.gp is None or not self.gp.get('is_trained', False):
+            return np.zeros(len(X)), np.ones(len(X))
+        try:
+            X_train = self.gp['X_train']
+            current_thetas = self.gp.get('thetas', self.thetas)
+            K_trans = self.custom_kernel(X_train, X, current_thetas)
+            y_mean = K_trans.T.dot(self.gp['alpha'])
+            K_self = self.custom_kernel(X, X, current_thetas)
+            y_var = np.diag(K_self) - np.sum(
+                K_trans * np.linalg.solve(self.gp['K'], K_trans), axis=0)
+            y_var = np.maximum(y_var, 1e-6)
+            return y_mean, np.sqrt(y_var)
+        except Exception:
+            return np.zeros(len(X)), np.ones(len(X))
+
+    def compute_diversity_scores(self, candidate_indices):
+        if len(candidate_indices) < 2 or len(self.tested_indices) == 0:
+            return np.zeros(len(candidate_indices))
+        scores = []
+        for idx in candidate_indices:
+            host_c, guest_c, conc_c, e1_c, e2_c = self.X_all[idx]
+            feature_diversities = []
+            for tested_idx in self.tested_indices:
+                host_t, guest_t, conc_t, e1_t, e2_t = self.X_all[tested_idx]
+                e1_diff = abs(float(e1_c) - float(e1_t)) / (self.feature_stats['e1_std'] + 1e-6)
+                e2_diff = abs(float(e2_c) - float(e2_t)) / (self.feature_stats['e2_std'] + 1e-6)
+                conc_diff = abs(float(conc_c) - float(conc_t)) / (self.feature_stats['conc_std'] + 1e-6)
+                host_diff = self.tanimoto_distance(host_c, host_t)
+                guest_diff = self.tanimoto_distance(guest_c, guest_t)
+                feature_diversities.append(
+                    max(e1_diff, e2_diff, conc_diff, host_diff, guest_diff))
+            scores.append(np.mean(feature_diversities) if feature_diversities else 1.0)
+        scores = np.array(scores)
+        if np.max(scores) > np.min(scores):
+            scores = (scores - np.min(scores)) / (np.max(scores) - np.min(scores))
+        return scores
+
+    def adaptive_acquisition_function(self, candidate_indices, beta=2.0):
+        if self.gp is None or len(candidate_indices) == 0:
+            return (np.random.random(len(candidate_indices)),
+                    np.zeros(len(candidate_indices)),
+                    np.ones(len(candidate_indices)))
+        try:
+            X_candidates = [self.X_all[i] for i in candidate_indices]
+            y_mean, y_std = self.predict(X_candidates)
+            n_tested, n_total = len(self.tested_indices), len(self.X_all)
+            exploration_ratio = 1.0 - (n_tested / n_total)
+            uncertainty_level = np.mean(y_std) / (np.std(self.y_initial) + 1e-6)
+            base_beta = 2.0
+            exploration_bonus = 1.0 * exploration_ratio
+            uncertainty_bonus = 0.5 * np.clip(uncertainty_level, 0.5, 2.0)
+            adaptive_beta = base_beta + exploration_bonus + uncertainty_bonus
+            diversity_scores = self.compute_diversity_scores(candidate_indices)
+            acquisition_scores = y_mean + adaptive_beta * y_std + 0.3 * diversity_scores
+            return acquisition_scores, y_mean, y_std
+        except Exception:
+            return (np.random.random(len(candidate_indices)),
+                    np.zeros(len(candidate_indices)),
+                    np.ones(len(candidate_indices)))
+
+    def acquisition_function(self, candidate_indices, beta=2.0):
+        return self.adaptive_acquisition_function(candidate_indices, beta)
+
+    def suggest_next_samples_with_forced_exploration(self, n_samples=6, beta=2.0,
+                                                     exploration_ratio=0.3):
+        all_untested = [i for i in range(len(self.X_all)) if i not in self.tested_indices]
+        untested_indices = []
+        for idx in all_untested:
+            host = self.df.iloc[idx]['HOST_SMILES']
+            guest = self.df.iloc[idx]['GUEST_SMILES']
+            if not self._is_combination_explored(host, guest):
+                untested_indices.append(idx)
+
+        if not untested_indices:
+            return [], [], [], [], []
+
+        acquisition_scores, y_means, y_stds = self.acquisition_function(untested_indices, beta)
+        sorted_idx = np.argsort(acquisition_scores)[::-1]
+
+        n_exploit = int(n_samples * (1 - exploration_ratio))
+        exploit_indices = [untested_indices[i] for i in sorted_idx[:n_exploit]]
+        remaining_indices = [untested_indices[i] for i in sorted_idx[n_exploit:]]
+
+        if remaining_indices:
+            diversity_scores = self.compute_diversity_scores(remaining_indices)
+            n_explore = n_samples - n_exploit
+            explore_sorted_idx = np.argsort(diversity_scores)[-n_explore:][::-1]
+            explore_indices = [remaining_indices[i] for i in explore_sorted_idx]
+            preliminary_recommendations = exploit_indices + explore_indices
+        else:
+            preliminary_recommendations = exploit_indices
+
+        def get_host_guest(idx):
+            return (self.df.iloc[idx]['HOST_SMILES'], self.df.iloc[idx]['GUEST_SMILES'])
+
+        final_recommendations = []
+        pair_count = {}
+        for idx in preliminary_recommendations:
+            pair = get_host_guest(idx)
+            if pair_count.get(pair, 0) < 2:
+                final_recommendations.append(idx)
+                pair_count[pair] = pair_count.get(pair, 0) + 1
+
+        if len(final_recommendations) < n_samples:
+            selected_set = set(final_recommendations)
+            extra_pool = [idx for idx in untested_indices if idx not in selected_set]
+            if extra_pool:
+                idx_to_score = {untested_indices[i]: acquisition_scores[i]
+                                for i in range(len(untested_indices))}
+                extra_pool_sorted = sorted(extra_pool,
+                                           key=lambda x: idx_to_score[x], reverse=True)
+                for idx in extra_pool_sorted:
+                    pair = get_host_guest(idx)
+                    if pair_count.get(pair, 0) < 2:
+                        final_recommendations.append(idx)
+                        pair_count[pair] = pair_count.get(pair, 0) + 1
+                        if len(final_recommendations) == n_samples:
+                            break
+
+        recommended_indices = final_recommendations[:n_samples]
+
+        idx_mapping = {idx: i for i, idx in enumerate(untested_indices)}
+        recommended_scores = [acquisition_scores[idx_mapping[idx]] for idx in recommended_indices]
+        recommended_means = [y_means[idx_mapping[idx]] for idx in recommended_indices]
+        recommended_stds = [y_stds[idx_mapping[idx]] for idx in recommended_indices]
+
+        candidate_info = []
+        for idx, score, mean, std in zip(untested_indices, acquisition_scores, y_means, y_stds):
+            candidate_info.append({
+                'index': idx,
+                'acquisition_score': score,
+                'predicted_mean': mean,
+                'predicted_std': std
+            })
+
+        return recommended_indices, recommended_scores, recommended_means, recommended_stds, candidate_info
+
+    def suggest_next_samples(self, n_samples=6, beta=2.0):
+        return self.suggest_next_samples_with_forced_exploration(
+            n_samples, beta, exploration_ratio=0.3)
+
+    def plot_chemical_space(self, recommended_indices=None, current_best_idx=None):
+        plt.figure(figsize=(12, 10))
+        if hasattr(self, 'chemical_space_2d') and self.chemical_space_2d is not None:
+            plt.scatter(self.chemical_space_2d[:, 0], self.chemical_space_2d[:, 1],
+                        alpha=0.5, c='lightgray', s=10, label='Untested')
+            if len(self.tested_indices) > 0:
+                tested_points = self.chemical_space_2d[self.tested_indices]
+                scatter = plt.scatter(tested_points[:, 0], tested_points[:, 1],
+                                      c=self.y_initial, cmap='viridis', s=20,
+                                      edgecolors='black', linewidth=0.1, label='Tested')
+                plt.colorbar(scatter, label='Activity')
+                if current_best_idx is not None and current_best_idx in self.tested_indices:
+                    best_idx_in_tested = self.tested_indices.index(current_best_idx)
+                    best_point = tested_points[best_idx_in_tested]
+                    plt.scatter(best_point[0], best_point[1], c='gold', s=20,
+                                marker='D', edgecolors='black', linewidth=0.1,
+                                label='Current Best')
+            if recommended_indices:
+                recommended_points = self.chemical_space_2d[recommended_indices]
+                plt.scatter(recommended_points[:, 0], recommended_points[:, 1],
+                            c='red', s=20, marker='*', edgecolors='black',
+                            linewidth=0.1, label='Recommended')
+                for k, idx in enumerate(recommended_indices):
+                    plt.annotate(f'Rec{k + 1}',
+                                 (recommended_points[k, 0], recommended_points[k, 1]),
+                                 xytext=(5, 5), textcoords='offset points',
+                                 fontsize=12, fontweight='bold', color='red')
+
+        theta_info = (f"theta1(E1)={self.thetas[0]:.2f}, theta2(E2)={self.thetas[1]:.2f}, "
+                      f"theta3(host)={self.thetas[2]:.2f}, theta4(guest)={self.thetas[3]:.2f}, "
+                      f"theta5(conc)={self.thetas[4]:.2f}")
+        plt.title(f'Chemical Space (5D distance UMAP) - Iteration {self.iteration}\n{theta_info}',
+                  fontsize=12, fontweight='bold')
+        plt.xticks([])
+        plt.yticks([])
+        for spine in plt.gca().spines.values():
+            spine.set_visible(False)
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.grid(False)
+        plt.tight_layout()
+        plt.show()
+
+    def plot_distance_components_analysis(self, sample_indices):
+        if self.df is None:
+            return
+        n_pairs = min(10, len(sample_indices))
+        components_data = []
+        for i in range(n_pairs):
+            for j in range(i + 1, n_pairs):
+                idx1, idx2 = sample_indices[i], sample_indices[j]
+                host_fp1 = self.smiles_to_fingerprint(self.df.iloc[idx1]['HOST_SMILES'])
+                host_fp2 = self.smiles_to_fingerprint(self.df.iloc[idx2]['HOST_SMILES'])
+                guest_fp1 = self.smiles_to_fingerprint(self.df.iloc[idx1]['GUEST_SMILES'])
+                guest_fp2 = self.smiles_to_fingerprint(self.df.iloc[idx2]['GUEST_SMILES'])
+                conc1, e1_1, e2_1 = self.df.iloc[idx1][['C_GUEST', 'E1', 'E2']].astype(float)
+                conc2, e1_2, e2_2 = self.df.iloc[idx2][['C_GUEST', 'E1', 'E2']].astype(float)
+                de1_sq = (e1_1 - e1_2) ** 2
+                de2_sq = (e2_1 - e2_2) ** 2
+                d_host_sq = self.tanimoto_distance(host_fp1, host_fp2) ** 2
+                d_guest_sq = self.tanimoto_distance(guest_fp1, guest_fp2) ** 2
+                d_conc_sq = (conc1 - conc2) ** 2
+                de1_norm = de1_sq / (self.feature_stats['e1_std'] ** 2)
+                de2_norm = de2_sq / (self.feature_stats['e2_std'] ** 2)
+                d_conc_norm = d_conc_sq / (self.feature_stats['conc_std'] ** 2)
+                total_distance = de1_norm + de2_norm + d_host_sq + d_guest_sq + d_conc_norm
+                if total_distance > 0:
+                    components_data.append({
+                        'pair': f'{idx1}-{idx2}',
+                        'E1_distance': de1_norm / total_distance,
+                        'E2_distance': de2_norm / total_distance,
+                        'host_fp_distance': d_host_sq / total_distance,
+                        'guest_fp_distance': d_guest_sq / total_distance,
+                        'conc_distance': d_conc_norm / total_distance
+                    })
+        if components_data:
+            components_df = pd.DataFrame(components_data)
+            fig, ax = plt.subplots(figsize=(12, 6))
+            components_df.set_index('pair')[[
+                'E1_distance', 'E2_distance', 'host_fp_distance',
+                'guest_fp_distance', 'conc_distance']].plot(
+                kind='bar', stacked=True, ax=ax, colormap='Set3')
+            plt.title('Relative Contribution of Five Distance Components')
+            plt.ylabel('Distance Contribution Ratio')
+            plt.xlabel('Sample Pair')
+            plt.xticks(rotation=45)
+            plt.legend(title='Distance Component')
+            plt.tight_layout()
+            plt.show()
+
+    def add_new_sample(self, sample_index, activity):
+        new_X = self.X_all[sample_index]
+        if self.X_initial is None:
+            self.X_initial = [new_X]
+            self.y_initial = np.array([float(activity)])
+        else:
+            self.X_initial.append(new_X)
+            self.y_initial = np.append(self.y_initial, float(activity))
+        self.tested_indices.append(sample_index)
+        self._update_combination_data(sample_index, activity)
+
+        if self.iteration % 3 == 0:
+            self.thetas = self.optimize_hyperparameters()
+        self._train_gp_model()
+        self.iteration += 1
+
+
+def save_optimizer_state(optimizer, filepath="optimizer_state.pkl"):
+    state = {
+        'X_initial': optimizer.X_initial,
+        'y_initial': optimizer.y_initial,
+        'tested_indices': optimizer.tested_indices,
+        'combination_data': optimizer.combination_data,
+        'thetas': optimizer.thetas,
+        'theta_bounds': optimizer.theta_bounds,
+        'iteration': optimizer.iteration,
+        'chemical_space_2d': optimizer.chemical_space_2d,
+        'distance_matrix': optimizer.distance_matrix,
+        'feature_stats': optimizer.feature_stats,
+        'descriptors_all': optimizer.descriptors_all,
+        'X_all': optimizer.X_all,
+        'df': optimizer.df,
+        'gp': optimizer.gp
+    }
+    with open(filepath, 'wb') as f:
+        pickle.dump(state, f)
+
+
+def save_recommendation_to_excel(iteration, recommended_indices, recommended_scores,
+                                 recommended_means, recommended_stds, df, save_path):
+    data = []
+    for i, idx in enumerate(recommended_indices, 1):
+        row = df.iloc[idx]
+        if (recommended_means[i - 1] > np.mean(recommended_means)
+                and recommended_stds[i - 1] < np.mean(recommended_stds)):
+            strategy = "Exploit"
+        elif recommended_stds[i - 1] > np.mean(recommended_stds):
+            strategy = "Explore"
+        else:
+            strategy = "Balanced"
+        data.append({
+            'Recommendation': f'Rec{i}',
+            'Index': idx,
+            'Host SMILES': row['HOST_SMILES'],
+            'Guest SMILES': row['GUEST_SMILES'],
+            'Concentration': row['C_GUEST'],
+            'E1': row['E1'],
+            'E2': row['E2'],
+            'Acquisition Score': recommended_scores[i - 1],
+            'Predicted Mean': recommended_means[i - 1],
+            'Predicted Std': recommended_stds[i - 1],
+            'Strategy': strategy
+        })
+    df_recommend = pd.DataFrame(data)
+    sheet_name = f'Iter_{iteration}_Recommend'
+    if os.path.exists(save_path):
+        with pd.ExcelWriter(save_path, engine='openpyxl', mode='a',
+                            if_sheet_exists='replace') as writer:
+            df_recommend.to_excel(writer, sheet_name=sheet_name, index=False)
+    else:
+        with pd.ExcelWriter(save_path, engine='openpyxl') as writer:
+            df_recommend.to_excel(writer, sheet_name=sheet_name, index=False)
+
+
+def save_all_candidates_to_excel(iteration, candidate_info, df, save_path):
+    data = []
+    for item in candidate_info:
+        idx = item['index']
+        row = df.iloc[idx]
+        data.append({
+            'Index': idx,
+            'Host SMILES': row['HOST_SMILES'],
+            'Guest SMILES': row['GUEST_SMILES'],
+            'Concentration': row['C_GUEST'],
+            'E1': row['E1'],
+            'E2': row['E2'],
+            'Acquisition Score': item['acquisition_score'],
+            'Predicted Mean': item['predicted_mean'],
+            'Predicted Std': item['predicted_std']
+        })
+    df_candidates = pd.DataFrame(data).sort_values('Acquisition Score', ascending=False)
+    sheet_name = f'Iter_{iteration}_Candidates'
+    if os.path.exists(save_path):
+        with pd.ExcelWriter(save_path, engine='openpyxl', mode='a',
+                            if_sheet_exists='replace') as writer:
+            df_candidates.to_excel(writer, sheet_name=sheet_name, index=False)
+    else:
+        with pd.ExcelWriter(save_path, engine='openpyxl') as writer:
+            df_candidates.to_excel(writer, sheet_name=sheet_name, index=False)
+
+
+def main():
+    optimizer = HostGuestBayesianOptimizer()
+    filepath = r"E:\Users\clz\Desktop\ML-data\chemical-space-H-G.xlsx"
+    save_path = r"E:\Users\clz\Desktop\recommendation_history.xlsx"
+
+    df = optimizer.load_data(filepath)
+
+    initial_indices = [151, 168, 220, 271, 344, 430, 435, 783, 897, 989,
+                       1260, 1350, 1354, 1412, 1414, 1448, 1514, 1644]
+    initial_activities = [72, 216, 48, 170, 77, 157, 131, 0, 738, 220,
+                          26, 262, 31, 152, 0, 82, 639, 177]
+    valid_indices, valid_activities = [], []
+    for idx, activity in zip(initial_indices, initial_activities):
+        if idx < len(df):
+            valid_indices.append(idx)
+            valid_activities.append(activity)
+
+    optimizer.initialize_with_samples(valid_indices, valid_activities)
+
+    optimizer.plot_distance_components_analysis(valid_indices[:5])
+    current_best_idx = valid_indices[np.argmax(valid_activities)]
+    optimizer.plot_chemical_space(current_best_idx=current_best_idx)
+
+    continue_optimization = True
+    beta = 2.0
+
+    while continue_optimization:
+        recommended_indices, recommended_scores, recommended_means, recommended_stds, candidate_info = \
+            optimizer.suggest_next_samples(n_samples=8, beta=beta)
+        if not recommended_indices:
+            break
+
+        save_recommendation_to_excel(
+            iteration=optimizer.iteration + 1,
+            recommended_indices=recommended_indices,
+            recommended_scores=recommended_scores,
+            recommended_means=recommended_means,
+            recommended_stds=recommended_stds,
+            df=df,
+            save_path=save_path
+        )
+        save_all_candidates_to_excel(
+            iteration=optimizer.iteration + 1,
+            candidate_info=candidate_info,
+            df=df,
+            save_path=save_path
+        )
+
+        current_best_idx = optimizer.tested_indices[np.argmax(optimizer.y_initial)]
+        optimizer.plot_chemical_space(recommended_indices, current_best_idx)
+
+        new_activities = []
+        for i, idx in enumerate(recommended_indices, 1):
+            while True:
+                try:
+                    activity = float(input(
+                        f"Enter activity for Rec{i} (index {idx}): ").strip())
+                    new_activities.append(activity)
+                    break
+                except ValueError:
+                    continue
+
+        for idx, activity in zip(recommended_indices, new_activities):
+            optimizer.add_new_sample(idx, activity)
+
+        current_best_idx = optimizer.tested_indices[np.argmax(optimizer.y_initial)]
+        optimizer.plot_chemical_space(current_best_idx=current_best_idx)
+
+        user_input = input("Continue optimization? (y/n): ").strip().lower()
+        if user_input not in ['y', 'yes']:
+            continue_optimization = False
+
+    best_idx = optimizer.tested_indices[np.argmax(optimizer.y_initial)]
+    best_activity = np.max(optimizer.y_initial)
+    print(f"Best activity: {best_activity} (index {best_idx})")
+    print(f"Total tested samples: {len(optimizer.y_initial)}")
+    print(f"Final thetas: {optimizer.thetas}")
+    print(f"Feature stats: {optimizer.feature_stats}")
+
+    optimizer.plot_chemical_space(current_best_idx=best_idx)
+    save_optimizer_state(optimizer, "optimizer_state.pkl")
+
+
+if __name__ == "__main__":
+    main()

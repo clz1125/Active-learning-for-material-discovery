@@ -1,0 +1,171 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.gaussian_process import GaussianProcessClassifier
+from sklearn.gaussian_process.kernels import ConstantKernel as C, Matern
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.metrics import (roc_auc_score, accuracy_score, classification_report,
+                             confusion_matrix, recall_score, precision_recall_curve,
+                             f1_score, precision_score)
+from sklearn.utils.class_weight import compute_class_weight
+import shap
+import warnings
+warnings.filterwarnings('ignore')
+
+file_path = r'E:\Users\clz\Desktop\ML-data\feature-important-1.xlsx'
+data = pd.read_excel(file_path)
+
+X = data.iloc[:, :12]   # First 12 columns are features
+y = data.iloc[:, 12]    # Column 13 is catalytic activity
+
+class_weights = compute_class_weight('balanced', classes=np.unique(y), y=y)
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=39)
+cv_scores = []
+
+for train_idx, test_idx in skf.split(X_scaled, y):
+    X_train, X_test = X_scaled[train_idx], X_scaled[test_idx]
+    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+    kernel = C(1.0, (0.1, 10.0)) * Matern(
+        length_scale=1.0,
+        length_scale_bounds=(0.1, 10.0),
+        nu=1.0
+    )
+
+    gpc = GaussianProcessClassifier(
+        kernel=kernel,
+        n_restarts_optimizer=10,
+        random_state=39
+    )
+
+    gpc.fit(X_train, y_train)
+    y_pred = gpc.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+    cv_scores.append(accuracy)
+
+kernel = C(1.0, (0.1, 10.0)) * Matern(
+    length_scale=1.0,
+    length_scale_bounds=(0.1, 10.0),
+    nu=1.0
+)
+
+gpc_full = GaussianProcessClassifier(
+    kernel=kernel,
+    n_restarts_optimizer=15,
+    random_state=39
+)
+gpc_full.fit(X_scaled, y)
+
+y_pred_full = gpc_full.predict(X_scaled)
+y_prob_full = gpc_full.predict_proba(X_scaled)[:, 1]
+
+precision, recall, thresholds = precision_recall_curve(y, y_prob_full)
+f1_scores = 2 * (precision * recall) / (precision + recall + 1e-8)
+best_threshold_idx = np.argmax(f1_scores[:-1])
+best_threshold = thresholds[best_threshold_idx]
+
+y_pred_default = (y_prob_full >= 0.5).astype(int)
+y_pred_optimized = (y_prob_full >= best_threshold).astype(int)
+y_pred_adjusted = y_pred_optimized.copy()
+
+if len(X_scaled) > 50:
+    background = shap.kmeans(X_scaled, 10)
+else:
+    background = X_scaled
+
+explainer = shap.KernelExplainer(gpc_full.predict_proba, background)
+shap_values = explainer.shap_values(X_scaled)
+
+shap_values_positive = shap_values[..., 1]
+
+feature_importance = np.mean(np.abs(shap_values_positive), axis=0)
+importance_df = pd.DataFrame({
+    'Feature': X.columns,
+    'SHAP_Importance': feature_importance
+}).sort_values('SHAP_Importance', ascending=False)
+
+plt.figure(figsize=(10, 8))
+importance_df_sorted = importance_df.sort_values('SHAP_Importance', ascending=True)
+
+custom_color = (0 / 255, 137 / 255, 251 / 255)
+plt.barh(importance_df_sorted['Feature'], importance_df_sorted['SHAP_Importance'],
+         color=custom_color, edgecolor='navy', linewidth=1)
+plt.xlabel('Mean(|SHAP value|) (average impact on model output magnitude)', fontsize=16)
+plt.grid(axis='x', alpha=0.5)
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(12, 8))
+shap.summary_plot(shap_values_positive, X_scaled, feature_names=X.columns, show=False)
+plt.tight_layout()
+plt.savefig(r'E:\Users\clz\Desktop\shap_beeswarm.eps',
+            format='eps', dpi=300, bbox_inches='tight', facecolor='white')
+plt.show()
+
+active_indices = np.where(y == 1)[0]
+
+correctly_predicted_active = []
+incorrectly_predicted_active = []
+
+for idx in active_indices:
+    true_label = y.iloc[idx] if hasattr(y, 'iloc') else y[idx]
+    pred_prob = gpc_full.predict_proba(X_scaled[idx].reshape(1, -1))[0, 1]
+    pred_label = (pred_prob >= best_threshold).astype(int)
+    is_correct = (pred_label == true_label)
+
+    if is_correct:
+        correctly_predicted_active.append(idx)
+    else:
+        incorrectly_predicted_active.append(idx)
+
+inactive_indices = np.where(y == 0)[0]
+
+correctly_predicted_inactive = []
+incorrectly_predicted_inactive = []
+
+for idx in inactive_indices:
+    true_label = y.iloc[idx] if hasattr(y, 'iloc') else y[idx]
+    pred_prob = gpc_full.predict_proba(X_scaled[idx].reshape(1, -1))[0, 1]
+    pred_label = (pred_prob >= best_threshold).astype(int)
+    is_correct = (pred_label == true_label)
+
+    if is_correct:
+        correctly_predicted_inactive.append(idx)
+    else:
+        incorrectly_predicted_inactive.append(idx)
+
+print("=" * 70)
+print("SHAP Analysis Final Report (Class Imbalance Handling)")
+print("=" * 70)
+
+print(f"\n1. Data Summary:")
+print(f"   - Total molecules: {len(y)}")
+print(f"   - Active molecules: {sum(y)} ({sum(y) / len(y):.1%})")
+print(f"   - Inactive molecules: {len(y) - sum(y)} ({(len(y) - sum(y)) / len(y):.1%})")
+
+print(f"\n2. Model Performance:")
+print(f"   - Cross-validation accuracy: {np.mean(cv_scores):.4f} (+/-{np.std(cv_scores):.4f})")
+print(f"   - Full dataset AUC: {roc_auc_score(y, y_prob_full):.4f}")
+
+print(f"\n3. Threshold Optimization:")
+print(f"   - Active recall at default threshold (0.5): {recall_score(y, y_pred_default):.1%}")
+print(f"   - Active recall at optimized threshold ({best_threshold:.4f}): {recall_score(y, y_pred_adjusted):.1%}")
+
+print(f"\n4. Top 5 SHAP Features:")
+for i, row in importance_df.head().iterrows():
+    print(f"   {i + 1}. {row['Feature']} (SHAP importance: {row['SHAP_Importance']:.4f})")
+
+print(f"\n5. Prediction Validation Summary (Optimized Threshold):")
+print(f"   - Active molecules: {len(correctly_predicted_active)}/{len(active_indices)} correct = {len(correctly_predicted_active) / len(active_indices):.1%}")
+print(f"   - Inactive molecules: {len(correctly_predicted_inactive)}/{len(inactive_indices)} correct = {len(correctly_predicted_inactive) / len(inactive_indices):.1%}")
+print(f"   - False positives (inactive -> active): {len(incorrectly_predicted_inactive)} - {incorrectly_predicted_inactive}")
+print(f"   - False negatives (active -> inactive): {len(incorrectly_predicted_active)} - {incorrectly_predicted_active}")
+
+importance_df.to_csv(r'E:\Users\clz\Desktop\ML-data\shap_feature_importance_balanced.csv',
+                     index=False, encoding='utf-8-sig')

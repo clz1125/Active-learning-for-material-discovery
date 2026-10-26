@@ -1,0 +1,129 @@
+import numpy as np
+
+
+def sequential_random_sampling(descriptors, n_samples_per_round, n_rounds, random_state=None):
+    """
+    Perform multi-round random sampling without replacement across rounds.
+
+    Parameters:
+    descriptors: standardized descriptor matrix
+    n_samples_per_round: number of samples selected per round
+    n_rounds: number of sampling rounds
+    random_state: random seed for reproducibility
+
+    Returns:
+    all_selected_indices: list of selected sample indices for all rounds (list of lists)
+    """
+    print(f"Starting multi-round random sampling: {n_rounds} rounds, "
+          f"{n_samples_per_round} samples per round")
+
+    n_total = len(descriptors)
+    max_possible_samples = n_rounds * n_samples_per_round
+
+    if max_possible_samples > n_total:
+        raise ValueError(
+            f"Requested total samples ({max_possible_samples}) exceed "
+            f"the total number of samples ({n_total})")
+
+    if random_state is not None:
+        np.random.seed(random_state)
+
+    available_indices = list(range(n_total))
+    all_selected_indices = []
+
+    for round_num in range(1, n_rounds + 1):
+        print(f"\n=== Round {round_num} random sampling ===")
+
+        if len(available_indices) < n_samples_per_round:
+            print(f"Warning: only {len(available_indices)} samples available, "
+                  f"cannot select {n_samples_per_round} samples")
+            break
+
+        selected_indices = np.random.choice(
+            available_indices,
+            size=n_samples_per_round,
+            replace=False
+        ).tolist()
+
+        for idx in selected_indices:
+            available_indices.remove(idx)
+
+        all_selected_indices.append(selected_indices)
+
+        print(f"Indices selected in round {round_num}: {selected_indices}")
+        print(f"Remaining available samples: {len(available_indices)}")
+
+    print(f"\nMulti-round random sampling completed: "
+          f"{len(all_selected_indices)} rounds performed")
+    print(f"Total samples selected: "
+          f"{sum(len(round_list) for round_list in all_selected_indices)}")
+
+    return all_selected_indices
+
+
+def analyze_sampling_results(all_selected_indices, molecule_ids):
+    """
+    Analyze multi-round sampling results.
+
+    Parameters:
+    all_selected_indices: list of selected sample indices for all rounds
+    molecule_ids: list of molecule IDs
+
+    Returns:
+    Dictionary containing the analysis results
+    """
+    print(f"\n{'=' * 50}")
+    print("Analysis of multi-round random sampling results")
+    print(f"{'=' * 50}")
+
+    for round_num, selected_indices in enumerate(all_selected_indices, 1):
+        print(f"\nMolecules selected in round {round_num}:")
+        for i, idx in enumerate(selected_indices):
+            print(f"  {i + 1:2d}. Molecule {idx}: {molecule_ids[idx]}")
+
+    all_selected = [idx for round_list in all_selected_indices for idx in round_list]
+    print(f"\nAll selected molecules ({len(all_selected)}): {sorted(all_selected)}")
+
+    if len(all_selected) != len(set(all_selected)):
+        print("Warning: duplicate selected molecules detected!")
+    else:
+        print("Validation: all selected molecules are unique")
+
+    return {
+        'all_selected': all_selected,
+        'rounds': all_selected_indices,
+        'total_selected': len(all_selected)
+    }
+
+
+if __name__ == "__main__":
+    
+
+    n_rounds = 17
+    n_samples_per_round = 6
+
+    all_selected = sequential_random_sampling(
+        descriptors_scaled,
+        n_samples_per_round,
+        n_rounds,
+        random_state=42
+    )
+
+   
+    results = analyze_sampling_results(all_selected, molecule_ids)
+
+  
+    with open("sequential_sampling_results.txt", "w") as f:
+        f.write("Multi-round random sampling results\n")
+        f.write("=" * 50 + "\n")
+
+        for round_num, selected_indices in enumerate(all_selected, 1):
+            f.write(f"\nMolecules selected in round {round_num}:\n")
+            for i, idx in enumerate(selected_indices):
+                f.write(f"  {i + 1:2d}. Molecule {idx}: {molecule_ids[idx]}\n")
+
+        f.write(f"\nTotal selected molecules: {results['total_selected']}\n")
+        f.write(f"All selected molecule indices: "
+                f"{sorted([idx for round_list in all_selected for idx in round_list])}\n")
+
+    print(f"\nResults saved to 'sequential_sampling_results.txt'")
